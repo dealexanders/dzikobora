@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dzikobora - Gra Online</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Dzikobora v0.2 — roles + SFX
+        // Actor = user, Enemy = dzik, Loot = trufle
+        // Controls: WASD / Arrow Keys. P to pause. R to restart. M to mute.
+
+        const WIDTH = 900;
+        const HEIGHT = 600;
+        const USER_SIZE = 22;
+        const USER_SPEED = 3.2;
+        const TRUFFLE_SIZE = 10;
+        const DZIK_SIZE = 28;
+        const STARTING_LIVES = 3;
+        const ROUND_TIME = 60; // seconds
+
+        function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+        function rand(min, max) { return Math.random() * (max - min) + min; }
+        function dist(a, b) { const dx = a.x - b.x; const dy = a.y - b.y; return Math.hypot(dx, dy); }
+
+        function spawnNonOverlapping(existing, size, padding = 16) {
+          let x, y; let tries = 0;
+          do {
+            x = rand(size + padding, WIDTH - size - padding);
+            y = rand(size + padding, HEIGHT - size - padding);
+            tries++;
+            if (tries > 200) break;
+          } while (existing.some(o => dist(o, {x, y}) < (o.size || USER_SIZE) + size + padding));
+          return { x, y };
+        }
+
+        function DzikoboraGame() {
+          const canvasRef = useRef(null);
+          const [running, setRunning] = useState(false);
+          const [paused, setPaused] = useState(false);
+          const [muted, setMuted] = useState(false);
+          const [score, setScore] = useState(0);
+          const [lives, setLives] = useState(STARTING_LIVES);
+          const [timeLeft, setTimeLeft] = useState(ROUND_TIME);
+          const [message, setMessage] = useState("Zbieraj trufle, unikaj dzików!");
+
+          const keys = useRef(new Set());
+          const user = useRef({ x: WIDTH/2, y: HEIGHT/2, size: USER_SIZE });
+          const trufle = useRef([]);
+          const dziki = useRef([]);
+          const lastTime = useRef(0);
+          const stepAccum = useRef(0);
+
+          // --- Audio ---
+          const audioCtxRef = useRef(null);
+          const masterGainRef = useRef(null);
+
+          function ensureAudio() {
+            if (!audioCtxRef.current) {
+              const ctx = new (window.AudioContext || window.webkitAudioContext)();
+              const master = ctx.createGain();
+              master.gain.value = muted ? 0 : 0.6;
+              master.connect(ctx.destination);
+              audioCtxRef.current = ctx;
+              masterGainRef.current = master;
+            }
+          }
+
+          useEffect(() => {
+            // reflect mute state in gain
+            if (masterGainRef.current) masterGainRef.current.gain.value = muted ? 0 : 0.6;
+          }, [muted]);
+
+          function playFootstep() {
+            if (!audioCtxRef.current || muted) return;
+            const ctx = audioCtxRef.current;
+            const dur = 0.09;
+            const noise = ctx.createBufferSource();
+            const buffer = ctx.createBuffer(1, ctx.sampleRate * dur, ctx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1) * Math.exp(-i/data.length*4);
+            noise.buffer = buffer;
+            const bp = ctx.createBiquadFilter();
+            bp.type = "bandpass"; bp.frequency.value = 220; bp.Q.value = 1.2;
+            const gain = ctx.createGain();
+            gain.gain.value = 0.25;
+            noise.connect(bp); bp.connect(gain); gain.connect(masterGainRef.current);
+            noise.start();
+          }
+
+          function playBite() {
+            if (!audioCtxRef.current || muted) return;
+            const ctx = audioCtxRef.current;
+            const osc = ctx.createOscillator(); osc.type = "triangle"; osc.frequency.setValueAtTime(650, ctx.currentTime);
+            const gain = ctx.createGain(); gain.gain.setValueAtTime(0.6, ctx.currentTime); gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+            osc.connect(gain); gain.connect(masterGainRef.current);
+            osc.start(); osc.stop(ctx.currentTime + 0.14);
+          }
+
+          function playSqueal() {
+            if (!audioCtxRef.current || muted) return;
+            const ctx = audioCtxRef.current;
+            const osc = ctx.createOscillator(); osc.type = "square";
+            const gain = ctx.createGain(); gain.gain.setValueAtTime(0.5, ctx.currentTime);
+            osc.frequency.setValueAtTime(300, ctx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(1100, ctx.currentTime + 0.08);
+            osc.frequency.exponentialRampToValueAtTime(380, ctx.currentTime + 0.22);
+            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.24);
+            osc.connect(gain); gain.connect(masterGainRef.current);
+            osc.start(); osc.stop(ctx.currentTime + 0.26);
+          }
+
+          // Setup keyboard
+          useEffect(() => {
+            const down = (e) => {
+              const k = e.key.toLowerCase();
+              keys.current.add(k);
+              if (k === "p") togglePause();
+              if (k === "r") reset();
+              if (k === "m") setMuted(m => !m);
+            };
+            const up = (e) => { keys.current.delete(e.key.toLowerCase()); };
+            window.addEventListener("keydown", down);
+            window.addEventListener("keyup", up);
+            return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+          }, []);
+
+          function start() {
+            if (running) return;
+            reset();
+            ensureAudio();
+            // Some browsers need a user gesture to resume
+            audioCtxRef.current?.resume?.();
+            setRunning(true);
+            setPaused(false);
+            setMessage("Start! Zbieraj trufle.");
+          }
+
+          function togglePause() {
+            if (!running) return;
+            setPaused(p => !p);
+            setMessage(m => (paused ? "Start!" : "Pauza"));
+          }
+
+          function reset() {
+            setScore(0); setLives(STARTING_LIVES); setTimeLeft(ROUND_TIME);
+            user.current = { x: WIDTH/2, y: HEIGHT/2, size: USER_SIZE };
+            trufle.current = [];
+            dziki.current = [];
+            for (let i=0;i<8;i++) trufle.current.push({ ...spawnNonOverlapping(trufle.current, TRUFFLE_SIZE), size: TRUFFLE_SIZE });
+            for (let i=0;i<4;i++) dziki.current.push(spawnDzik());
+            setRunning(false); setPaused(false);
+            stepAccum.current = 0;
+            setMessage("Zbierz 8 trufli i przetrwaj 60s.");
+          }
+
+          function spawnDzik() {
+            const { x, y } = spawnNonOverlapping([...trufle.current, user.current], DZIK_SIZE, 24);
+            const speed = rand(1.2, 2.0);
+            const dir = Math.random() * Math.PI * 2;
+            return { x, y, size: DZIK_SIZE, vx: Math.cos(dir)*speed, vy: Math.sin(dir)*speed, t: 0 };
+          }
+
+          // Game loop
+          useEffect(() => {
+            const ctx = canvasRef.current?.getContext("2d");
+            let raf;
+
+            const loop = (ts) => {
+              if (!ctx) return;
+              if (!lastTime.current) lastTime.current = ts;
+              const dt = Math.min(0.033, (ts - lastTime.current) / 1000); // clamp delta
+              lastTime.current = ts;
+
+              // Update
+              if (running && !paused) {
+                // timer
+                setTimeLeft(t => {
+                  const nt = Math.max(0, t - dt);
+                  if (nt === 0) {
+                    endGame("Koniec czasu! 🎉");
+                  }
+                  return nt;
+                });
+
+                // user move
+                const p = user.current;
+                const up = keys.current.has("arrowup") || keys.current.has("w");
+                const down = keys.current.has("arrowdown") || keys.current.has("s");
+                const left = keys.current.has("arrowleft") || keys.current.has("a");
+                const right = keys.current.has("arrowright") || keys.current.has("d");
+                let vx = (right?1:0) - (left?1:0);
+                let vy = (down?1:0) - (up?1:0);
+                const mag = Math.hypot(vx, vy);
+                const norm = mag || 1;
+                p.x = clamp(p.x + (vx/norm)*USER_SPEED*60*dt, p.size, WIDTH - p.size);
+                p.y = clamp(p.y + (vy/norm)*USER_SPEED*60*dt, p.size, HEIGHT - p.size);
+
+                // footsteps cadence (only when moving)
+                const moving = mag > 0;
+                if (moving) {
+                  stepAccum.current += dt;
+                  const stepInterval = 0.28 / (1 + 0.12*mag); // a bit faster when moving diagonally
+                  if (stepAccum.current >= stepInterval) {
+                    playFootstep();
+                    stepAccum.current = 0;
+                  }
+                } else {
+                  stepAccum.current = 0; // reset when standing
+                }
+
+                // dziki wander + steer toward user occasionally
+                dziki.current.forEach(b => {
+                  b.t += dt;
+                  const steerChance = 0.015; // small chance per frame to re-aim
+                  if (Math.random() < steerChance) {
+                    const ang = Math.atan2(p.y - b.y, p.x - b.x) + rand(-0.8, 0.8);
+                    const sp = Math.hypot(b.vx, b.vy) || rand(1.2, 2.0);
+                    b.vx = Math.cos(ang) * sp;
+                    b.vy = Math.sin(ang) * sp;
+                  }
+                  b.x += b.vx * 60 * dt;
+                  b.y += b.vy * 60 * dt;
+                  if (b.x < b.size || b.x > WIDTH - b.size) b.vx *= -1;
+                  if (b.y < b.size || b.y > HEIGHT - b.size) b.vy *= -1;
+                });
+
+                // collisions: trufle
+                trufle.current = trufle.current.filter(tr => {
+                  if (dist(user.current, tr) < user.current.size + tr.size) {
+                    playBite();
+                    setScore(s => s + 10);
+                    return false;
+                  }
+                  return true;
+                });
+                while (trufle.current.length < 8) {
+                  trufle.current.push({ ...spawnNonOverlapping([...trufle.current, ...dziki.current, user.current], TRUFFLE_SIZE), size: TRUFFLE_SIZE });
+                }
+
+                // collisions: dziki
+                for (let i = 0; i < dziki.current.length; i++) {
+                  const b = dziki.current[i];
+                  if (dist(user.current, b) < user.current.size + b.size - 6) {
+                    // hit!
+                    playSqueal();
+                    setLives(L => {
+                      const n = L - 1;
+                      if (n <= 0) endGame("Dzik cię dopadł! 💥");
+                      return n;
+                    });
+                    // knock back
+                    user.current.x = WIDTH/2; user.current.y = HEIGHT/2;
+                  }
+                }
+              }
+
+              // Draw
+              ctx.clearRect(0,0,WIDTH,HEIGHT);
+
+              // background
+              const grd = ctx.createLinearGradient(0,0,0,HEIGHT);
+              grd.addColorStop(0, "#185a37");
+              grd.addColorStop(1, "#0d3b26");
+              ctx.fillStyle = grd; ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+              // grid
+              ctx.strokeStyle = "rgba(255,255,255,0.06)";
+              ctx.lineWidth = 1;
+              for (let x=0; x<WIDTH; x+=30) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,HEIGHT); ctx.stroke(); }
+              for (let y=0; y<HEIGHT; y+=30) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(y,HEIGHT); ctx.stroke(); }
+
+              // trufle (visuals: brown cap with white marbling)
+              trufle.current.forEach(tr => {
+                ctx.beginPath();
+                ctx.fillStyle = "#6b3f2a"; // brown
+                ctx.arc(tr.x, tr.y, tr.size, 0, Math.PI*2);
+                ctx.fill();
+                ctx.strokeStyle = "#e9dfcf"; // light marbling
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(tr.x - tr.size*0.6, tr.y - tr.size*0.2);
+                ctx.quadraticCurveTo(tr.x, tr.y + tr.size*0.4, tr.x + tr.size*0.6, tr.y - tr.size*0.3);
+                ctx.stroke();
+              });
+
+              // dziki
+              dziki.current.forEach(b => {
+                // body
+                ctx.fillStyle = "#5a3e36";
+                ctx.beginPath(); ctx.arc(b.x, b.y, b.size, 0, Math.PI*2); ctx.fill();
+                // snout
+                ctx.fillStyle = "#7b5247";
+                ctx.beginPath(); ctx.arc(b.x + b.size*0.55, b.y, b.size*0.5, 0, Math.PI*2); ctx.fill();
+                // tusks
+                ctx.fillStyle = "#f2eadf";
+                ctx.beginPath(); ctx.ellipse(b.x + b.size*0.9, b.y - b.size*0.2, 6, 3, 0, 0, Math.PI*2); ctx.fill();
+                ctx.beginPath(); ctx.ellipse(b.x + b.size*0.9, b.y + b.size*0.2, 6, 3, 0, 0, Math.PI*2); ctx.fill();
+              });
+
+              // user
+              const p = user.current;
+              ctx.fillStyle = "#ffdd33";
+              ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+              ctx.strokeStyle = "#f6b700"; ctx.lineWidth = 3; ctx.stroke();
+
+              // UI overlay text
+              ctx.fillStyle = "#ffffff"; ctx.font = "16px Inter, system-ui, sans-serif";
+              ctx.fillText(`Wynik: ${score}`, 14, 22);
+              ctx.fillText(`Życia: ${lives}`, 140, 22);
+              ctx.fillText(`Czas: ${Math.ceil(timeLeft)}`, 240, 22);
+
+              // message
+              if (!running) {
+                drawCenterText(ctx, "DZIKOBORA", 56, 0, -40);
+                drawCenterText(ctx, "Zbieraj trufle. Unikaj dzików.", 20, 0, 0);
+                drawCenterText(ctx, "START — WASD/Strzałki, P pauza, R restart, M dźwięk", 16, 0, 34);
+              } else if (paused) {
+                drawCenterText(ctx, "PAUZA", 44, 0, 0);
+              }
+
+              raf = requestAnimationFrame(loop);
+            };
+
+            raf = requestAnimationFrame(loop);
+            return () => cancelAnimationFrame(raf);
+          }, [running, paused, score, lives, timeLeft, muted]);
+
+          function drawCenterText(ctx, text, size, dx=0, dy=0) {
+            ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.font = `bold ${size}px Inter, system-ui`;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText(text, WIDTH/2 + 2 + dx, HEIGHT/2 + 2 + dy);
+            ctx.fillStyle = "#ffffff"; ctx.fillText(text, WIDTH/2 + dx, HEIGHT/2 + dy);
+          }
+
+          function endGame(reason) {
+            setRunning(false); setPaused(false);
+            setMessage(`${reason} Wynik końcowy: ${score}`);
+          }
+
+          return (
+            <div className="w-full h-full flex items-center justify-center p-4 bg-neutral-900 text-white">
+              <div className="w-full max-w-[1000px]">
+                <div className="flex items-center justify-between mb-3">
+                  <h1 className="text-2xl font-bold">Dzikobora v0.2</h1>
+                  <div className="flex gap-2">
+                    <button onClick={start} className="px-3 py-1.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 transition">Start</button>
+                    <button onClick={togglePause} className="px-3 py-1.5 rounded-2xl bg-amber-600 hover:bg-amber-500 transition" disabled={!running}>{paused ? "Wznów" : "Pauza"}</button>
+                    <button onClick={() => setMuted(m => !m)} className="px-3 py-1.5 rounded-2xl bg-sky-700 hover:bg-sky-600 transition">{muted ? "Wyciszony" : "Dźwięk"}</button>
+                    <button onClick={reset} className="px-3 py-1.5 rounded-2xl bg-slate-700 hover:bg-slate-600 transition">Reset</button>
+                  </div>
+                </div>
+                <div className="rounded-2xl overflow-hidden shadow-2xl ring-1 ring-white/10">
+                  <canvas ref={canvasRef} width={WIDTH} height={HEIGHT} className="block w-full h-auto bg-[#0e4029]" />
+                </div>
+                <div className="mt-3 text-sm text-white/80">{message}</div>
+                <div className="mt-4 text-xs text-white/60">
+                  SFX: kroki podczas ruchu, chrupnięcie jabłka przy trufli, kwik dzika przy trafieniu. (WebAudio, bez assetów.)
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        // Render the game
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<DzikoboraGame />);
+    </script>
+</body>
+</html>
